@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"container/list"
 )
 
 const (
@@ -51,7 +52,18 @@ var (
 	ErrDlinkNotFound = errors.New("未取得下载链接")
 	MsgBody string
 	DownloaderMap = make(map[int]*downloader.Downloader)
+	downloadList *list.List = list.New()
+	completeList *list.List = list.New()
+	downloadOccupy[100] int
 )
+
+func getDownloadList() *list.List{
+	return downloadList
+}
+
+func getCompleteList() *list.List{
+	return completeList
+}
 
 type (
 	// ListTask 队列状态 (基类)
@@ -67,6 +79,7 @@ type (
 		path         string                  // 下载的路径
 		savePath     string                  // 保存的路径
 		downloadInfo *baidupcs.FileDirectory // 文件或目录详情
+		complete bool                        // 是否下载完成
 	}
 
 	//DownloadOptions 下载可选参数
@@ -128,7 +141,9 @@ func download(conn *websocket.Conn, id int, downloadURL, savePath string, loadBa
 			defer file.Close()
 		}
 		if err != nil {
-			sendResponse(conn, 2, -4, "初始化下载发生错误", "")
+			//sendResponse(conn, 2, -4, "初始化下载发生错误", "")
+			sendRoutineRequest(10,2, -4, "初始化下载发生错误", "")
+
 		}
 
 		// 空指针和空接口不等价
@@ -211,27 +226,44 @@ func download(conn *websocket.Conn, id int, downloadURL, savePath string, loadBa
 					converter.ConvertFileSize(speeds, 2),
 					converter.ConvertFileSize(avgSpeed, 2),
 					timeUsed, leftStr)
-				sendResponse(conn, 2, 5, "下载中", MsgBody)
+				//sendResponse(conn, 2, 5, "下载中", MsgBody)
+
+				sendRoutineRequest(1,2,5,"下载中", MsgBody)
 			}
 		}
 	})
 	download.OnPause(func() {
 		MsgBody = fmt.Sprintf("{\"LastID\": %d}", id)
-		sendResponse(conn, 2, 6, "任务暂停", MsgBody)
+		//sendResponse(conn, 2, 6, "任务暂停", MsgBody)
+		sendRoutineRequest(9, 2, 6, "任务暂停", MsgBody)
 		fmt.Println("\n任务暂停, ID:", id)
 	})
 	download.OnResume(func() {
 		MsgBody = fmt.Sprintf("{\"LastID\": %d}", id)
-		sendResponse(conn, 2, 7, "任务恢复", MsgBody)
+		//sendResponse(conn, 2, 7, "任务恢复", MsgBody)
+		sendRoutineRequest(8,2, 7, "任务恢复", MsgBody)
 		fmt.Println("\n任务恢复, ID:", id)
 	})
 	download.OnCancel(func() {
 		MsgBody = fmt.Sprintf("{\"LastID\": %d}", id)
-		sendResponse(conn, 2, 8, "任务取消", MsgBody)
+		//sendResponse(conn, 2, 8, "任务取消", MsgBody)
+		sendRoutineRequest(7,2, 8, "任务取消", MsgBody)
+
+		head := downloadList.Front()
+		for i := 0; i < downloadList.Len(); i++ {
+			if head.Value.(*dtask).ID == id && strings.Contains(savePath, strings.Trim(head.Value.(*dtask).path, "/")) == true{
+				downloadList.Remove(head)
+				fmt.Println("\n[DEBUG]任务取消，移除任务",id , savePath)
+				break
+			}
+			head = head.Next()
+		}
+
 		fmt.Println("\n任务取消, ID:", id)
 	})
 	download.OnFinish(func() {
 		DownloaderMap[id] = nil
+		downloadOccupy[id] = 0
 		fmt.Println("\n任务完成, ID:", id)
 	})
 
@@ -252,14 +284,29 @@ func download(conn *websocket.Conn, id int, downloadURL, savePath string, loadBa
 	if downloadOptions.IsExecutedPermission {
 		err = file.Chmod(0766)
 		if err != nil {
-			sendResponse(conn, 2, -5, "警告, 加执行权限错误", "")
+			//sendResponse(conn, 2, -5, "警告, 加执行权限错误", "")
+			sendRoutineRequest(6,2, -5, "警告, 加执行权限错误", "")
 			fmt.Fprintf(downloadOptions.Out, "[%d] 警告, 加执行权限错误: %s\n", id, err)
 		}
 	}
 
 	if !newCfg.IsTest {
 		MsgBody = fmt.Sprintf("{\"LastID\": %d, \"savePath\": \"%s\"}", id, savePath)
-		sendResponse(conn, 2, 9, "下载完成", MsgBody)
+		//sendResponse(conn, 2, 9, "下载完成", MsgBody)
+		sendRoutineRequest(5,2, 9, "下载完成", MsgBody)
+		head := downloadList.Front()
+		for i := 0; i < downloadList.Len(); i++{
+			if head.Value.(*dtask).ID == id && strings.Contains(savePath, strings.Trim(head.Value.(*dtask).path, "/")) == true{
+				head.Value.(*dtask).complete = true
+				head.Value.(*dtask).path = savePath
+				fmt.Println("\n[DEBUG]下载完成，状态置为complete")
+				break
+			}
+			head = head.Next()
+		}
+		
+
+		
 		fmt.Fprintf(downloadOptions.Out, "[%d] 下载完成, 保存位置: %s\n", id, savePath)
 	} else {
 		fmt.Fprintf(downloadOptions.Out, "[%d] 测试下载结束\n", id)
@@ -373,13 +420,32 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 
 	// 处理队列
 	for k := range paths {
-		lastID++
+		
+		//是否已经处于下载状态
+		head := downloadList.Front()
+		for ii := 0; ii < downloadList.Len(); ii++ {
+			if head.Value.(*dtask).path == paths[k] {
+				fmt.Println("\n已经存在下载任务，不进行下载")
+				return 
+			}
+			head = head.Next()
+		}
+		
+		//找到一个空闲的task
+		for i := 0; i < 100; i++{
+			if 	downloadOccupy[i] == 0 {
+				downloadOccupy[i] = 1
+				lastID = i
+				break
+			}
+		}
 		ptask := &dtask{
 			ListTask: ListTask{
 				ID:       lastID,
 				MaxRetry: options.MaxRetry,
 			},
 			path: paths[k],
+			complete: false,
 		}
 		if options.SaveTo != "" {
 			ptask.savePath = filepath.Join(options.SaveTo, filepath.Base(paths[k]))
@@ -389,7 +455,9 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 		dlist.Append(ptask)
 		fmt.Fprintf(options.Out, "[%d] 加入下载队列: %s\n", lastID, paths[k])
 		MsgBody = fmt.Sprintf("{\"LastID\": %d, \"path\": \"%s\"}", lastID, paths[k])
-		sendResponse(conn, 2, 1, "添加进任务队列", MsgBody)
+		downloadList.PushBack(ptask)
+		//sendResponse(conn, 2, 1, "添加进任务队列", MsgBody)
+		sendRoutineRequest(2,2, 1, "添加进任务队列", MsgBody)
 	}
 
 	var (
@@ -411,7 +479,17 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 			case strings.Compare(errManifest, StrDownloadFailed) == 0 && strings.Contains(err.Error(), StrDownloadInitError):
 				fmt.Fprintf(options.Out, "[%d] %s, %s\n", task.ID, errManifest, err)
 				MsgBody = fmt.Sprintf("{\"LastID\": %d, \"errManifest\": \"%s\", \"error\": \"%s\"}", task.ID, errManifest, err)
-				err = sendResponse(conn, 2, -1, "下载文件错误", MsgBody)
+				//err = sendResponse(conn, 2, -1, "下载文件错误", MsgBody)
+				sendRoutineRequest(3, 2, -1, "下载文件错误", MsgBody)
+				head := downloadList.Front()
+				for i := 0; i < downloadList.Len(); i++ {
+					if head.Value.(*dtask).ID == task.ID && strings.Contains(task.path, strings.Trim(head.Value.(*dtask).path, "/")) == true{
+						downloadList.Remove(head)
+						fmt.Println("\n[DEBUG]获取路径信息错误，移除任务",task.ID , task.path)
+						break
+					}
+					head = head.Next()
+				}
 				return
 			}
 
@@ -419,7 +497,8 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 			if task.retry < task.MaxRetry {
 				task.retry++
 				MsgBody = fmt.Sprintf("{\"LastID\": %d, \"errManifest\": \"%s\", \"error\": \"%s\", \"retry\": %d, \"max_retry\": %d}", task.ID, errManifest, err, task.retry, task.MaxRetry)
-				sendResponse(conn, 2, -2, "重试", MsgBody)
+				//sendResponse(conn, 2, -2, "重试", MsgBody)
+				sendRoutineRequest(4, 2, -2, "重试", MsgBody)
 				fmt.Fprintf(options.Out, "[%d] %s, %s, 重试 %d/%d\n", task.ID, errManifest, err, task.retry, task.MaxRetry)
 				dlist.Append(task)
 				time.Sleep(3 * time.Duration(task.retry) * time.Second)
@@ -466,7 +545,18 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 				if err != nil {
 					// 不重试
 					MsgBody = fmt.Sprintf("{\"LastID\": %d, \"error\": \"%s\"}", task.ID, err)
-					sendResponse(conn, 2, -3, "获取路径信息错误", MsgBody)
+					//sendResponse(conn, 2, -3, "获取路径信息错误", MsgBody)
+					sendRoutineRequest(12, 2, -3, "获取路径信息错误", MsgBody)
+					head := downloadList.Front()
+					for i := 0; i < downloadList.Len(); i++ {
+						if head.Value.(*dtask).ID == task.ID && strings.Contains(task.path, strings.Trim(head.Value.(*dtask).path, "/")) == true{
+							downloadList.Remove(head)
+							fmt.Println("\n[DEBUG]获取路径信息错误，移除任务",task.ID , task.path)
+							break
+						}
+						head = head.Next()
+					}
+					
 					fmt.Printf("[%d] 获取路径信息错误, %s\n", task.ID, err)
 					return
 				}
@@ -485,13 +575,24 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 				if err != nil {
 					// 不重试
 					MsgBody = fmt.Sprintf("{\"LastID\": %d, \"error\": \"%s\"}", task.ID, err)
-					sendResponse(conn, 2, -3, "获取目录信息错误", MsgBody)
+					//sendResponse(conn, 2, -3, "获取目录信息错误", MsgBody)
+					sendRoutineRequest(11, 2, -3, "获取目录信息错误", MsgBody)
 					fmt.Fprintf(options.Out, "[%d] 获取目录信息错误, %s\n", task.ID, err)
+					head := downloadList.Front()
+					for i := 0; i < downloadList.Len(); i++ {
+						if head.Value.(*dtask).ID == task.ID && strings.Contains(task.path, strings.Trim(head.Value.(*dtask).path, "/")) == true{
+							downloadList.Remove(head)
+							fmt.Println("\n[DEBUG]获取路径信息错误，移除任务",task.ID , task.path)
+							break
+						}
+						head = head.Next()
+					}
 					return
 				}
 
 				MsgBody = fmt.Sprintf("{\"LastID\": %d}", task.ID)
-				sendResponse(conn, 2, 8, "删除文件夹任务", MsgBody)
+				//sendResponse(conn, 2, 8, "删除文件夹任务", MsgBody)
+				sendRoutineRequest(13, 2, 8, "删除文件夹任务", MsgBody)
 
 				for k := range fileList {
 					lastID++
@@ -502,6 +603,7 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 						},
 						path:         fileList[k].Path,
 						downloadInfo: fileList[k],
+						complete: false,
 					}
 
 					if options.SaveTo != "" {
@@ -513,26 +615,31 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 					dlist.Append(subTask)
 					fmt.Fprintf(options.Out, "[%d] 加入下载队列: %s\n", lastID, fileList[k].Path)
 					MsgBody = fmt.Sprintf("{\"LastID\": %d, \"path\": \"%s\"}", lastID, fileList[k].Path)
-					sendResponse(conn, 2, 1, "添加进任务队列", MsgBody)
+					downloadList.PushBack(subTask)
+					//sendResponse(conn, 2, 1, "添加进任务队列", MsgBody)
+					sendRoutineRequest(14, 2, 1, "添加进任务队列", MsgBody)
 				}
 				return
 			}
 
 			fmt.Fprintf(options.Out, "[%d] 准备下载: %s\n", task.ID, task.path)
 			MsgBody = fmt.Sprintf("{\"LastID\": %d, \"path\": \"%s\"}", task.ID, task.path)
-			sendResponse(conn, 2, 3, "准备下载", MsgBody)
+			//sendResponse(conn, 2, 3, "准备下载", MsgBody)
+			sendRoutineRequest(15,  2, 3, "准备下载", MsgBody)
 
 			if !options.IsTest && !options.IsOverwrite && fileExist(task.savePath) {
 				fmt.Fprintf(options.Out, "[%d] 文件已经存在: %s, 跳过...\n", task.ID, task.savePath)
 				MsgBody = fmt.Sprintf("{\"LastID\": %d, \"savePath\": \"%s\"}", task.ID, task.savePath)
-				sendResponse(conn, 2, -4, "文件已经存在, 跳过...", MsgBody)
+				//sendResponse(conn, 2, -4, "文件已经存在, 跳过...", MsgBody)
+				sendRoutineRequest(16, 2, -4, "文件已经存在, 跳过...", MsgBody)
 				return
 			}
 
 			if !options.IsTest {
 				fmt.Fprintf(options.Out, "[%d] 将会下载到路径: %s\n\n", task.ID, task.savePath)
 				MsgBody = fmt.Sprintf("{\"LastID\": %d, \"savePath\": \"%s\"}", task.ID, task.savePath)
-				sendResponse(conn, 2, 4, "将会下载到路径", MsgBody)
+				//sendResponse(conn, 2, 4, "将会下载到路径", MsgBody)
+				sendRoutineRequest(17, 2, 4, "将会下载到路径", MsgBody)
 			}
 
 			// 获取直链, 或者以分享文件的方式获取下载链接来下载

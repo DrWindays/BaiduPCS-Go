@@ -11,7 +11,13 @@ import (
 
 var distBox *rice.Box
 var distMobileBox *rice.Box
+	
+//创建WS消息发送线程通道
+var connCh = make(chan *websocket.Conn)
 
+func getConnChannel() chan *websocket.Conn {
+	return connCh
+}
 // StartServer 开启web服务
 func StartServer(port uint, access bool) error {
 	if port <= 0 || port > 65535 {

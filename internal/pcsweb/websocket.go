@@ -104,6 +104,7 @@ loginSuccess:
 		fmt.Printf("保存配置错误: %s\n", err)
 	}
 	fmt.Printf("保存配置成功\n")
+
 	return err
 }
 
@@ -126,7 +127,7 @@ func WSDownload(conn *websocket.Conn, rJson *simplejson.Json) (err error) {
 			options.IsStreaming = true
 		}
 
-		RunDownload(conn, paths, options)
+		go RunDownload(conn, paths, options)
 		return
 	}
 	return
@@ -142,14 +143,21 @@ func WSUpload(conn *websocket.Conn, rJson *simplejson.Json) (err error) {
 
 func WSHandler(conn *websocket.Conn) {
 	fmt.Printf("Websocket新建连接: %s -> %s\n", conn.RemoteAddr().String(), conn.LocalAddr().String())
+	connCh = getConnChannel()
+	exitCh = getExitCh()
+	
 
+	connCh <- conn
 	for {
 		var reply string
+
 		if err := websocket.Message.Receive(conn, &reply); err != nil {
 			fmt.Println("Websocket连接断开:", err.Error())
 			conn.Close()
 			return
 		}
+
+
 		rJson, err := simplejson.NewJson([]byte(reply))
 		if err != nil {
 			fmt.Println("receive err:", err.Error())
@@ -166,6 +174,7 @@ func WSHandler(conn *websocket.Conn) {
 			}
 		case 2:
 			WSDownload(conn, rJson)
+
 			if err != nil {
 				fmt.Println("WSDownload err:", err.Error())
 				continue

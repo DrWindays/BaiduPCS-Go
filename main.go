@@ -31,6 +31,7 @@ var (
 		}
 		return nil
 	}
+
 )
 
 func init() {
@@ -58,6 +59,11 @@ func init() {
 		pcsweb.GlobalSessions.Init()
 		go pcsweb.GlobalSessions.GC()
 	}
+	
+
+
+	go pcsweb.SendWSRequestRoutine()
+
 }
 
 func main() {
